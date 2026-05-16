@@ -42,6 +42,14 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 
+import android.media.AudioAttributes;
+import android.media.MediaPlayer;
+import android.os.Handler;
+import android.os.Looper;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.util.concurrent.TimeUnit;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "SYNC";
@@ -52,6 +60,16 @@ public class MainActivity extends AppCompatActivity {
             .followRedirects(true)
             .build();
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
+
+    private MediaPlayer localPlayer = null;
+    private boolean localPrepared = false;
+    private Handler localTickHandler = null;
+    private Runnable localTickRunnable = null;
+    private final OkHttpClient downloadHttp = new OkHttpClient.Builder()
+        .followRedirects(true)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
+        .build();
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override
@@ -108,6 +126,18 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public WebResourceResponse shouldInterceptRequest(
                     WebView view, WebResourceRequest request) {
+                String uStr = request.getUrl().toString();
+                if (uStr.startsWith("https://localthumb.sync/")) {
+                String vid = uStr.substring(uStr.lastIndexOf('/') + 1);
+                if (vid.endsWith(".jpg")) vid = vid.substring(0, vid.length() - 4);
+                File tf = new File(new File(getFilesDir(), "thumb"), vid + ".jpg");
+                if (tf.exists()) {
+                    try { return new WebResourceResponse("image/jpeg", null, new FileInputStream(tf)); }
+                    catch (Exception ignored) {}
+                }
+                return null;
+                }
+                
                 WebResourceResponse response =
                         assetLoader.shouldInterceptRequest(request.getUrl());
                 if (response == null) return null;
@@ -146,6 +176,19 @@ public class MainActivity extends AppCompatActivity {
                         executor.submit(() -> doSuggest(msg)); break;
                     case "fetchLyrics":
                         executor.submit(() -> doFetchLyrics(msg)); break;
+                    case "downloadTrack":
+                        executor.submit(() -> doDownloadTrack(msg)); break;
+                    case "localPlay":
+                        runOnUiThread(() -> doLocalPlay(_lpMsg)); break;
+                    case "localPause":
+                        runOnUiThread(this::doLocalPause); break;
+                    case "localSeek":
+                        final JSONObject _lsMsg = msg;
+                        runOnUiThread(() -> doLocalSeek(_lsMsg)); break;
+                    case "localStop":
+                        runOnUiThread(this::doLocalStop); break;
+                    case "deleteLocal":
+                        executor.submit(() -> doDeleteLocal(msg)); break;
                     case "orientation":
                         String orient = msg.optString("value", "sensor");
                         runOnUiThread(() -> setOrientation(orient)); break;
@@ -777,10 +820,248 @@ public class MainActivity extends AppCompatActivity {
         return c.replaceAll("\\s{2,}", " ").trim();
     }
 
+    /* ══ DOWNLOAD ══ */
+private void doDownloadTrack(JSONObject msg) {
+    String videoId = msg.optString("videoId");
+    String callId  = msg.optString("id", "0");
+    try {
+        sendProgress(videoId, 0);
+        String audioUrl = getYouTubeAudioUrl(videoId);
+        if (audioUrl == null) throw new IOException("스트림 URL 없음");
+
+        File audioDir = new File(getFilesDir(), "audio");
+        File thumbDir = new File(getFilesDir(), "thumb");
+        audioDir.mkdirs(); thumbDir.mkdirs();
+
+        File audioFile = new File(audioDir, videoId + ".m4a");
+        File thumbFile = new File(thumbDir, videoId + ".jpg");
+
+        downloadFileWithProgress(audioUrl, audioFile, videoId);
+        downloadThumb("https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg", thumbFile);
+
+        JSONObject result = new JSONObject();
+        result.put("type", "downloadResult");
+        result.put("id", callId);
+        result.put("videoId", videoId);
+        result.put("success", true);
+        result.put("audioPath", audioFile.getAbsolutePath());
+        sendToJs(result);
+    } catch (Exception e) {
+        try {
+            JSONObject err = new JSONObject();
+            err.put("type", "downloadResult");
+            err.put("id", callId);
+            err.put("videoId", videoId);
+            err.put("success", false);
+            err.put("error", e.getMessage());
+            sendToJs(err);
+        } catch (JSONException ignored) {}
+    }
+}
+
+private String getYouTubeAudioUrl(String videoId) throws Exception {
+    String URL = "https://www.youtube.com/youtubei/v1/player" +
+                 "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false";
+    JSONObject client = new JSONObject();
+    client.put("clientName", "ANDROID");
+    client.put("clientVersion", "19.09.37");
+    client.put("androidSdkVersion", 30);
+    client.put("hl", "ko"); client.put("gl", "KR");
+    JSONObject context = new JSONObject(); context.put("client", client);
+    JSONObject body = new JSONObject();
+    body.put("context", context); body.put("videoId", videoId);
+    body.put("contentCheckOk", true); body.put("racyCheckOk", true);
+
+    Request req = new Request.Builder().url(URL)
+            .post(RequestBody.create(body.toString(),
+                    MediaType.parse("application/json; charset=utf-8")))
+            .addHeader("User-Agent",
+                    "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip")
+            .addHeader("X-YouTube-Client-Name", "3")
+            .addHeader("X-YouTube-Client-Version", "19.09.37")
+            .build();
+
+    try (Response resp = downloadHttp.newCall(req).execute()) {
+        if (!resp.isSuccessful() || resp.body() == null)
+            throw new IOException("HTTP " + resp.code());
+        JSONObject doc = new JSONObject(readUtf8(resp));
+        if (!doc.has("streamingData")) throw new IOException("streamingData 없음");
+        JSONArray adaptive = doc.getJSONObject("streamingData").optJSONArray("adaptiveFormats");
+        if (adaptive != null) {
+            String bestUrl = null; int bestBitrate = 0;
+            for (int i = 0; i < adaptive.length(); i++) {
+                JSONObject fmt = adaptive.getJSONObject(i);
+                if (!fmt.optString("mimeType","").startsWith("audio/")) continue;
+                String furl = fmt.optString("url","");
+                if (furl.isEmpty()) continue;
+                int bitrate = fmt.optInt("bitrate", 0);
+                if (bitrate > bestBitrate) { bestBitrate = bitrate; bestUrl = furl; }
+            }
+            if (bestUrl != null) return bestUrl;
+        }
+        JSONArray formats = doc.getJSONObject("streamingData").optJSONArray("formats");
+        if (formats != null)
+            for (int i = 0; i < formats.length(); i++) {
+                String furl = formats.getJSONObject(i).optString("url","");
+                if (!furl.isEmpty()) return furl;
+            }
+        throw new IOException("사용 가능한 포맷 없음");
+    }
+}
+
+private void downloadFileWithProgress(String url, File dest, String videoId) throws IOException {
+    Request req = new Request.Builder().url(url)
+            .addHeader("User-Agent",
+                    "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip")
+            .build();
+    try (Response resp = downloadHttp.newCall(req).execute()) {
+        if (!resp.isSuccessful() || resp.body() == null)
+            throw new IOException("HTTP " + resp.code());
+        long total = resp.body().contentLength();
+        long written = 0; int lastPct = -1;
+        byte[] buf = new byte[16384];
+        try (java.io.InputStream in = resp.body().byteStream();
+             FileOutputStream out = new FileOutputStream(dest)) {
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n); written += n;
+                if (total > 0) {
+                    int pct = (int)(written * 100 / total);
+                    if (pct != lastPct && pct % 5 == 0) { lastPct = pct; sendProgress(videoId, pct); }
+                }
+            }
+        }
+    }
+}
+
+private void downloadThumb(String url, File dest) {
+    try {
+        Request req = new Request.Builder().url(url).build();
+        try (Response resp = http.newCall(req).execute()) {
+            if (!resp.isSuccessful() || resp.body() == null) return;
+            byte[] bytes = resp.body().bytes();
+            try (FileOutputStream out = new FileOutputStream(dest)) { out.write(bytes); }
+        }
+    } catch (Exception ignored) {}
+}
+
+private void sendProgress(String videoId, int pct) {
+    try {
+        JSONObject ev = new JSONObject();
+        ev.put("type", "downloadProgress");
+        ev.put("videoId", videoId); ev.put("percent", pct);
+        sendToJs(ev);
+    } catch (JSONException ignored) {}
+}
+
+/* ══ LOCAL MEDIAPLAYER ══ */
+private void doLocalPlay(JSONObject msg) {
+    doLocalStop();
+    String path = msg.optString("path");
+    try {
+        localPlayer = new MediaPlayer();
+        localPrepared = false;
+        localPlayer.setDataSource(path);
+        localPlayer.setAudioAttributes(new AudioAttributes.Builder()
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setUsage(AudioAttributes.USAGE_MEDIA).build());
+        localPlayer.setOnPreparedListener(mp -> {
+            localPrepared = true; mp.start(); startLocalTick();
+            try {
+                JSONObject ev = new JSONObject();
+                ev.put("type", "localPlayerEvent"); ev.put("event", "playing");
+                ev.put("duration", mp.getDuration() / 1000.0); sendToJs(ev);
+            } catch (JSONException ignored) {}
+        });
+        localPlayer.setOnCompletionListener(mp -> {
+            stopLocalTick();
+            try {
+                JSONObject ev = new JSONObject();
+                ev.put("type", "localPlayerEvent"); ev.put("event", "ended"); sendToJs(ev);
+            } catch (JSONException ignored) {}
+        });
+        localPlayer.setOnErrorListener((mp, what, extra) -> {
+            stopLocalTick();
+            try {
+                JSONObject ev = new JSONObject();
+                ev.put("type", "localPlayerEvent"); ev.put("event", "error"); sendToJs(ev);
+            } catch (JSONException ignored) {}
+            return true;
+        });
+        localPlayer.prepareAsync();
+    } catch (Exception e) {
+        try {
+            JSONObject ev = new JSONObject();
+            ev.put("type", "localPlayerEvent"); ev.put("event", "error");
+            ev.put("msg", e.getMessage()); sendToJs(ev);
+        } catch (JSONException ignored) {}
+    }
+}
+
+private void doLocalPause() {
+    if (localPlayer == null || !localPrepared) return;
+    try {
+        String evName;
+        if (localPlayer.isPlaying()) { localPlayer.pause(); evName = "paused"; }
+        else { localPlayer.start(); evName = "resumed"; }
+        JSONObject obj = new JSONObject();
+        obj.put("type", "localPlayerEvent"); obj.put("event", evName); sendToJs(obj);
+    } catch (Exception ignored) {}
+}
+
+private void doLocalSeek(JSONObject msg) {
+    double sec = msg.optDouble("time", 0);
+    if (localPlayer != null && localPrepared)
+        try { localPlayer.seekTo((int)(sec * 1000)); } catch (Exception ignored) {}
+}
+
+private void doLocalStop() {
+    stopLocalTick();
+    if (localPlayer != null) {
+        try { localPlayer.stop(); } catch (Exception ignored) {}
+        localPlayer.release(); localPlayer = null;
+    }
+    localPrepared = false;
+}
+
+private void startLocalTick() {
+    stopLocalTick();
+    localTickHandler = new Handler(Looper.getMainLooper());
+    localTickRunnable = new Runnable() {
+        @Override public void run() {
+            if (localPlayer != null && localPrepared) {
+                try {
+                    JSONObject ev = new JSONObject();
+                    ev.put("type", "localTimeUpdate");
+                    ev.put("current", localPlayer.getCurrentPosition() / 1000.0);
+                    ev.put("duration", localPlayer.getDuration() / 1000.0);
+                    ev.put("playing", localPlayer.isPlaying());
+                    sendToJs(ev);
+                } catch (JSONException ignored) {}
+                localTickHandler.postDelayed(this, 250);
+            }
+        }
+    };
+    localTickHandler.postDelayed(localTickRunnable, 250);
+}
+
+private void stopLocalTick() {
+    if (localTickHandler != null && localTickRunnable != null)
+        localTickHandler.removeCallbacks(localTickRunnable);
+    localTickHandler = null; localTickRunnable = null;
+}
+
+private void doDeleteLocal(JSONObject msg) {
+    String videoId = msg.optString("videoId");
+    new File(new File(getFilesDir(), "audio"), videoId + ".m4a").delete();
+    new File(new File(getFilesDir(), "thumb"), videoId + ".jpg").delete();
+}
+    
     @Override protected void onPause()   { super.onPause();   webView.onPause(); }
     @Override protected void onResume()  { super.onResume();  webView.onResume(); }
     @Override protected void onDestroy() {
         super.onDestroy();
+        doLocalStop();
         executor.shutdown();
         webView.destroy();
     }

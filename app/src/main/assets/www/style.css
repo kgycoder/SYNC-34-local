@@ -1161,6 +1161,14 @@ img {
         stroke: var(--acc);
     }
 
+#np-save-btn.on {
+    color: var(--acc);
+}
+#np-save-btn.on svg path,
+#np-save-btn.on svg polyline {
+    stroke: var(--acc);
+}
+
 /* Progress bar */
 .np-prog-wrap {
     width: 100%;

@@ -975,6 +975,7 @@ function playTrack(t, idx = -1) {
     document.getElementById('b-title').textContent = t.title;
     document.getElementById('b-ch').textContent = t.channel || 'YouTube';
     updFavBtn();
+    updLocalSaveBtn();
     const npArt = document.getElementById('np-art');
     npArt.src = hq; npArt.onerror = () => { npArt.src = md; npArt.onerror = () => { npArt.src = t.thumb; }; };
     document.getElementById('np-title').textContent = t.title;
@@ -1514,6 +1515,48 @@ function updFavBtn() {
     const f = S.track && isFav(S.track.id);
     ['b-fav', 'np-fav'].forEach(id => document.getElementById(id)?.classList.toggle('on', !!f));
 }
+/* ════════════════════════════════════════════
+   LOCAL SAVE
+════════════════════════════════════════════ */
+const LOCAL_PL_NAME = 'Local Music';
+
+function getOrCreateLocalPl() {
+    let pl = PL.lists.find(p => p.name === LOCAL_PL_NAME);
+    if (!pl) {
+        pl = { id: 'local_' + Date.now(), name: LOCAL_PL_NAME, tracks: [], local: true };
+        PL.lists.unshift(pl); plSave(); plRenderGrid();
+    }
+    return pl;
+}
+function isLocalSaved(id) {
+    const pl = PL.lists.find(p => p.name === LOCAL_PL_NAME);
+    return pl ? pl.tracks.some(t => t.id === id) : false;
+}
+function saveToLocal(track) {
+    if (!track) return;
+    const pl = getOrCreateLocalPl();
+    if (pl.tracks.some(t => t.id === track.id)) { toast('이미 저장된 음악이에요'); return; }
+    pl.tracks.push({ id: track.id, title: track.title, channel: track.channel, dur: track.dur, thumb: track.thumb });
+    if (LY.lines.length > 0 && LY.videoId === track.id)
+        localStorage.setItem('xw_lrc_' + track.id, JSON.stringify(LY.lines));
+    plSave(); plRenderGrid(); updLocalSaveBtn();
+    toast('✦ Local Music에 저장됨');
+}
+function removeFromLocal(id) {
+    const pl = PL.lists.find(p => p.name === LOCAL_PL_NAME);
+    if (!pl) return;
+    pl.tracks = pl.tracks.filter(t => t.id !== id);
+    plSave(); updLocalSaveBtn();
+    toast('Local Music에서 제거됨');
+}
+function toggleLocalSave() {
+    if (!S.track) return;
+    isLocalSaved(S.track.id) ? removeFromLocal(S.track.id) : saveToLocal(S.track);
+}
+function updLocalSaveBtn() {
+    const on = S.track && isLocalSaved(S.track.id);
+    document.getElementById('np-save-btn')?.classList.toggle('on', !!on);
+}
 function refreshDots() {
     document.querySelectorAll('.c-fav').forEach(d => {
         const id = d.closest('.card')?.dataset?.id; if (!id) return;
@@ -2013,6 +2056,20 @@ async function fetchLyrics(videoId) {
     LY.lines = [];
     LY.curIdx = -1;
     _showLyricsLoading();
+       // ↓ 여기부터 추가
+    const _cached = localStorage.getItem('xw_lrc_' + videoId);
+    if (_cached) {
+        try {
+            const _cl = JSON.parse(_cached);
+            if (_cl && _cl.length > 0) {
+                LY._fetching = null; LY.videoId = videoId; LY.lines = _cl;
+                _renderLyrics();
+                if (NP_LS.active) { NP_LS.curIdx = -1; _renderLsLyrics(); }
+                return;
+            }
+        } catch(e) {}
+    }
+    // ↑ 여기까지 추가
     try {
         const title = S.track?.title ?? '';
         const channel = S.track?.channel ?? '';
@@ -2074,6 +2131,8 @@ function _renderLyrics() {
     });
     artArea.classList.add('has-lyrics');
     _startLyricsTick();
+    if (S.track && isLocalSaved(S.track.id))  // ← 이 줄 추가
+       localStorage.setItem('xw_lrc_' + S.track.id, JSON.stringify(LY.lines)); // ← 이 줄 추가
     if (OV.active) _buildOvLyricsDOM();
 }
 
